@@ -27,8 +27,10 @@ import {
   AlignLeft,
   Layers,
   Heart,
-  AlertOctagon
+  AlertOctagon,
+  Loader2
 } from 'lucide-react';
+import { generateDynamicClinicalNote } from './clinicalEngine';
 
 // Preset Clinical Cases for 1-Click Evaluation
 const SAMPLE_CASES = [
@@ -435,8 +437,12 @@ export default function App() {
   // Real-time Mic Recording State
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
+  const [liveSpeechStatus, setLiveSpeechStatus] = useState<string>('');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const timerRef = useRef<any>(null);
+  const recognitionRef = useRef<any>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   // Model Connectivity Status
   const [apiStatus, setApiStatus] = useState<'checking' | 'connected' | 'error'>('checking');
@@ -472,17 +478,107 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
 
-      mediaRecorder.start();
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.start(250);
       setIsRecording(true);
       setRecordingSeconds(0);
+      setLiveSpeechStatus('Listening to microphone (speak now)...');
 
       timerRef.current = setInterval(() => {
         setRecordingSeconds((prev) => prev + 1);
       }, 1000);
 
-      mediaRecorder.onstop = () => {
+      // Start Web Speech Recognition if available in the browser (Chrome, Edge, Safari)
+      const SpeechRecognitionClass =
+        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+      if (SpeechRecognitionClass) {
+        try {
+          const recognition = new SpeechRecognitionClass();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang = 'en-US';
+
+          let initialText = transcript;
+          // If transcript currently has sample case text, clear it so doctor starts fresh
+          if (SAMPLE_CASES.some((sc) => sc.transcript === transcript)) {
+            initialText = '';
+            setTranscript('');
+          }
+
+          recognition.onresult = (event: any) => {
+            let sessionTranscript = '';
+            for (let i = 0; i < event.results.length; ++i) {
+              sessionTranscript += event.results[i][0].transcript + ' ';
+            }
+            if (sessionTranscript.trim()) {
+              const updated = initialText
+                ? `${initialText.trim()} ${sessionTranscript.trim()}`
+                : sessionTranscript.trim();
+              setTranscript(updated);
+              setLiveSpeechStatus('Live Speech Captured');
+            }
+          };
+
+          recognition.onerror = (e: any) => {
+            console.warn('Speech recognition warning:', e.error);
+          };
+
+          recognition.start();
+          recognitionRef.current = recognition;
+        } catch (e) {
+          console.warn('Could not start Web Speech Recognition:', e);
+        }
+      }
+
+      mediaRecorder.onstop = async () => {
         stream.getTracks().forEach((track) => track.stop());
+
+        // If Web Speech API wasn't supported or captured 0 words, transcribe audio with ElevenLabs Scribe v2 Medical!
+        if (
+          audioChunksRef.current.length > 0 &&
+          (!recognitionRef.current || !transcript.trim())
+        ) {
+          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+          if (audioBlob.size > 1000) {
+            setIsTranscribingAudio(true);
+            try {
+              const formData = new FormData();
+              formData.append('file', audioBlob, 'doctor_dictation.webm');
+              formData.append('model_id', 'scribe_v2_medical');
+
+              const apiKey =
+                import.meta.env.VITE_ELEVENLABS_API_KEY ||
+                'sk_1a7beca48ead6dc93c5dcb9e0599137066047569dbab9bbd';
+
+              const res = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+                method: 'POST',
+                headers: { 'xi-api-key': apiKey },
+                body: formData,
+              });
+
+              if (res.ok) {
+                const data = await res.json();
+                if (data.text) {
+                  setTranscript((prev) =>
+                    prev ? `${prev.trim()} ${data.text.trim()}` : data.text.trim()
+                  );
+                }
+              }
+            } catch (err) {
+              console.error('Audio transcription error:', err);
+            } finally {
+              setIsTranscribingAudio(false);
+            }
+          }
+        }
       };
     } catch (err) {
       alert('Microphone access was denied or is unavailable in your browser.');
@@ -494,21 +590,53 @@ export default function App() {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
       clearInterval(timerRef.current);
-      // Append a simulated dictated transcription block
-      setTranscript((prev) =>
-        prev + `\n[Dictation Recorded: ${recordingSeconds}s encounter note - Patient continues conservative regimen with mild improvement.]`
-      );
+      setLiveSpeechStatus('');
+
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
     }
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setTranscript(
-        `[Audio file loaded: "${file.name}" (${(file.size / (1024 * 1024)).toFixed(2)} MB)]\n` +
-          `Patient audio consult ready for Meta Muse analysis.\n` +
-          SAMPLE_CASES[0].transcript
-      );
+    if (!file) return;
+
+    setIsTranscribingAudio(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('model_id', 'scribe_v2_medical');
+
+      const apiKey =
+        import.meta.env.VITE_ELEVENLABS_API_KEY ||
+        'sk_1a7beca48ead6dc93c5dcb9e0599137066047569dbab9bbd';
+
+      const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail?.message || errData.error || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      if (data.text) {
+        setTranscript(data.text);
+      } else {
+        throw new Error('No transcription text returned');
+      }
+    } catch (err: any) {
+      alert(`Audio transcription error: ${err.message}`);
+    } finally {
+      setIsTranscribingAudio(false);
     }
   };
 
@@ -532,212 +660,6 @@ Maintain high clinical precision and flag any missing elements as "not reported"
     }
   };
 
-  // Intelligent Clinical Reasoning Engine (Zero-Cost / Offline / Dynamic)
-  const generateClinicalNote = (input: string, mode: string) => {
-    const text = input.toLowerCase();
-    
-    // Check presentation categories
-    const isSpine = text.includes('back') || text.includes('spine') || text.includes('radicul') || text.includes('sciatica') || text.includes('leg raise');
-    const isCardiac = text.includes('chest') || text.includes('angina') || text.includes('substernal') || text.includes('coronary') || text.includes('myocardial');
-    const isDiabetes = text.includes('diabet') || text.includes('glucose') || text.includes('a1c') || text.includes('neuropathy') || text.includes('burning foot');
-    const isPulmonary = text.includes('wheez') || text.includes('asthma') || text.includes('cough') || text.includes('breath') || text.includes('respiratory');
-
-    // Extract vitals if mentioned
-    const bpMatch = input.match(/BP\s*[:=]?\s*(\d{2,3}\/\d{2,3})/i);
-    const hrMatch = input.match(/HR\s*[:=]?\s*(\d{2,3})/i);
-    const spo2Match = input.match(/SpO2\s*[:=]?\s*(\d{2,3}%?)/i);
-    const rrMatch = input.match(/RR\s*[:=]?\s*(\d{1,2})/i);
-
-    const vitalsStr = [
-      bpMatch ? `BP: ${bpMatch[1]} mmHg` : null,
-      hrMatch ? `HR: ${hrMatch[1]} bpm` : null,
-      rrMatch ? `RR: ${rrMatch[1]} /min` : null,
-      spo2Match ? `SpO2: ${spo2Match[1]}` : null,
-    ].filter(Boolean).join(', ') || 'Vitals stable as recorded in encounter.';
-
-    if (mode === 'patient_summary') {
-      return `### Patient After-Visit Summary & Plain-Language Instructions
-Generated by Meta Muse Clinical Engine • 6th-Grade Reading Level
-
-**What We Discussed Today:**
-We carefully reviewed your symptoms and clinical examination. Your presentation is consistent with ${
-        isSpine ? 'nerve irritation in your lower back radiating into your leg (often called sciatica or radiculopathy).' :
-        isCardiac ? 'heart-related symptoms that require close emergency evaluation.' :
-        isDiabetes ? 'nerve changes related to your blood sugar levels (peripheral neuropathy).' :
-        isPulmonary ? 'airway irritation and narrowing (asthma flare-up).' :
-        'your current symptoms as discussed during today\'s consultation.'
-      }
-
-**Your Daily Plan & Next Steps:**
-1. **Medications**: Take prescribed medications exactly as directed. Do not skip doses without contacting our clinic.
-2. **Activity & Rest**: ${isSpine ? 'Stay gently active. Avoid prolonged sitting or heavy lifting. Walking on level ground is encouraged.' : 'Rest and avoid strenuous physical exertion until cleared.'}
-3. **Follow-Up Appointment**: Please return to our office in 2 to 3 weeks for re-evaluation, or as scheduled with our reception.
-
-**When to Seek Immediate Emergency Medical Attention (Red Flags):**
-Go to the nearest emergency room or call emergency services immediately if you experience:
-- ${isSpine ? 'Sudden numbness around your groin/pelvic area, loss of control over your bowel or bladder, or new severe leg weakness (difficulty lifting your foot).' :
-    isCardiac ? 'Worsening chest tightness, pressure spreading to your arms or jaw, sudden sweating, or trouble breathing.' :
-    'Sudden worsening symptoms, severe dizziness, chest pain, or difficulty breathing.'}`;
-    }
-
-    if (mode === 'differential') {
-      if (isSpine) {
-        return `### Comprehensive Differential Diagnosis & Red-Flag Assessment
-Model: Meta Muse Wonder 1.0 (Clinical Reasoning Engine)
-
-#### 1. Primary Working Differential:
-- **Lumbar Radiculopathy secondary to Intervertebral Disc Herniation (L4-L5 / L5-S1)**: 
-  - *Clinical Probability*: High (>80%).
-  - *Supporting Evidence*: Dermatomal radicular pain, aggravation with seated posture (elevated intradiscal pressure), positive Straight Leg Raise.
-
-#### 2. Secondary Differentials to Systematically Rule Out:
-- **Lumbar Spinal Stenosis**: Typical in older patients, characterized by neurogenic claudication relieved by lumbar flexion (shopping cart sign).
-- **Piriformis Syndrome / Extraspinal Sciatic Entrapment**: Sciatic pain triggered by deep gluteal palpation without central spine tenderness.
-- **Sacroiliac (SI) Joint Dysfunction**: Positive FABER/Patrick test; localized pain over the posterior superior iliac spine (PSIS).
-- **Greater Trochanteric Pain Syndrome / Coxopathy**: Hip joint pathology mimicking L4-L5 dermatomal distribution.
-
-#### 3. Emergency Red-Flag Screening (Cauda Equina Syndrome):
-- Saddle anesthesia (S2-S5 dermatomes)
-- Urinary retention / overflow incontinence
-- Loss of anal sphincter tone
-- Rapidly progressive bilateral motor deficit
-- *Status*: Screened; pertinent negatives must be actively documented in EHR.`;
-      }
-    }
-
-    // Default: Comprehensive SOAP Note + ICD-10 Coding
-    if (isSpine) {
-      return `### S — Subjective
-- **History of Present Illness (HPI)**: 52-year-old female presenting with 3 weeks of persistent lower back pain radiating to the left lower extremity. Symptoms are noticeably exacerbated by prolonged sitting and alleviated by lying flat.
-- **Pertinent Negatives**: Denies bowel or bladder incontinence, saddle anesthesia, bilateral lower extremity weakness, progressive sensory loss, fevers, chills, or history of malignancy.
-- **Prior History / Meds**: No prior spinal surgeries. Current home medications and allergies documented in chart.
-
-### O — Objective
-- **Vital Signs**: ${vitalsStr}
-- **Physical Examination**:
-  - Musculoskeletal / Spine: Decreased lumbar range of motion in flexion. Tenderness to palpation over left paraspinal musculature.
-  - Provocative Tests: Straight Leg Raise (SLR) test positive on the left side at 45 degrees, reproducing radicular leg symptoms. Contralateral (well-leg) SLR negative.
-  - Neurological: Patellar and Achilles deep tendon reflexes 2+ bilaterally. Lower extremity motor strength intact (5/5) across L4, L5, and S1 myotomes. Intact sensation to light touch.
-
-### A — Assessment
-1. **Lumbar Radiculopathy, Left Side**: Presentation is classical for lumbosacral nerve root compression (most commonly L4–L5 or L5–S1 disc protrusion), corroborated by physical exam and postural provocation.
-2. **Clinical Mimics Considered**: Spinal stenosis, piriformis syndrome, SI joint arthropathy, and peripheral neuropathy.
-
-#### Recommended ICD-10-CM Coding:
-- **M54.42** — *Lumbago with sciatica, left side* (Appropriate for initial diagnostic coding before definitive MRI confirmation of disc pathology).
-- **M54.17** — *Radiculopathy, lumbosacral region* (Alternative symptom code; CMS guidelines advise avoiding duplicate coding alongside M54.42).
-- **M51.16** — *Intervertebral disc disorders with radiculopathy, lumbar region* (To be assigned if herniated disc is confirmed on imaging).
-
-### P — Plan
-1. **Conservative Management Protocol (< 6 Weeks)**:
-   - Activity modification: Avoid prolonged seated postures; implement ergonomic lumbar support.
-   - Pharmacotherapy: First-line oral NSAIDs (Naproxen 500mg PO BID with meals for 10-14 days) pending review of renal function and GI tolerance.
-   - Physical Therapy referral: Lumbar stabilization, core strengthening, and McKenzie directional preference extension protocol.
-2. **Diagnostic Imaging (ACR Appropriateness Criteria)**:
-   - Routine lumbar MRI is NOT indicated during the first 6 weeks for uncomplicated radiculopathy without progressive neurologic deficits.
-   - Non-contrast Lumbar Spine MRI indicated if symptoms persist beyond 6 weeks of structured conservative therapy or if focal neurological deficits progress.
-3. **Emergency Precautions & Red Flags**:
-   - Patient counseled on Cauda Equina Syndrome symptoms (saddle numbness, urinary retention, bowel incontinence, acute leg weakness). Advised to report immediately to the nearest Emergency Department if any emerge.
-4. **Follow-Up**: Re-evaluation in clinic in 3 weeks.`;
-    }
-
-    if (isCardiac) {
-      return `### S — Subjective
-- **History of Present Illness (HPI)**: 64-year-old male presenting with 2 hours of acute substernal chest pressure radiating to the left shoulder and jaw, triggered by exertion. Associated with diaphoresis and nausea.
-- **Pertinent Negatives**: Denies sharp pleuritic pain, positional worsening, fever, or prior similar episodes.
-
-### O — Objective
-- **Vital Signs**: ${vitalsStr}
-- **Physical Examination**: Patient is anxious, diaphoretic. Cardiovascular exam: S1/S2 present, regular rhythm, no audible murmurs, rubs, or gallops. Lungs clear to auscultation bilaterally.
-
-### A — Assessment
-1. **Acute Coronary Syndrome (ACS) / Unstable Angina vs NSTEMI**: Exertional onset, radiation pattern, and autonomic symptoms warrant urgent rule-out.
-2. **Critical Differentials**: Aortic dissection, pulmonary embolism, tension pneumothorax, esophageal spasm.
-
-#### Recommended ICD-10-CM Coding:
-- **I20.9** — *Angina pectoris, unspecified*
-- **R07.9** — *Chest pain, unspecified*
-- **I21.9** — *Acute myocardial infarction, unspecified* (Pending cardiac enzyme confirmation)
-
-### P — Plan
-1. **Immediate Diagnostic Workup**: Immediate 12-lead ECG, serial high-sensitivity Cardiac Troponins (0h, 1h/3h protocol), and chest radiograph.
-2. **Acute Pharmacotherapy**: Aspirin 324 mg chewed, sublingual Nitroglycerin (holding if SBP < 90 or RV infarction suspected), supplemental O2 if SpO2 < 90%.
-3. **Disposition**: Continuous telemetry monitoring and urgent Cardiology consultation.`;
-    }
-
-    if (isDiabetes) {
-      return `### S — Subjective
-- **Chief Complaint**: 58-year-old male with poorly controlled Type 2 Diabetes presenting with 4 months of progressive bilateral burning sensation, numbness, and tingling in both feet, worse at night.
-- **Review of Systems**: Denies open skin lesions, foot ulcers, claudication, or focal weakness.
-
-### O — Objective
-- **Vital Signs**: ${vitalsStr}
-- **Physical Examination**: Bilaterally symmetric diminished perception to 10g Semmes-Weinstein monofilament over plantar metatarsal heads. Reduced vibratory sense at bilateral great toes. Distal pulses (DP/PT) 2+ bilaterally. Skin intact without erythema or calluses.
-
-### A — Assessment
-1. **Distal Symmetric Polyneuropathy (Diabetic Peripheral Neuropathy)** secondary to Type 2 Diabetes Mellitus with chronic hyperglycemia (recent HbA1c 9.4%).
-2. **Differentials**: Vitamin B12 deficiency neuropathy, alcoholic polyneuropathy, hypothyroidism, uremic neuropathy.
-
-#### Recommended ICD-10-CM Coding:
-- **E11.40** — *Type 2 diabetes mellitus with diabetic neuropathy, unspecified*
-- **E11.65** — *Type 2 diabetes mellitus with hyperglycemia*
-- **E11.22** — *Type 2 diabetes mellitus with diabetic chronic kidney disease* (If microalbuminuria present)
-
-### P — Plan
-1. **Symptom Management**: Initiate Gabapentin 300 mg PO nightly; titrate to 300 mg TID as tolerated, or Duloxetine 30 mg PO daily.
-2. **Glycemic & Lab Optimization**: Optimize basal-bolus insulin or GLP-1 RA therapy to target HbA1c < 7.0%. Order serum B12, TSH, and spot urine albumin-to-creatinine ratio.
-3. **Preventive Foot Care**: Comprehensive daily foot self-inspection education, proper diabetic footwear prescription, and podiatry referral.
-4. **Follow-Up**: Clinic review in 4 weeks for medication titration and glycemic monitoring.`;
-    }
-
-    if (isPulmonary) {
-      return `### S — Subjective
-- **Chief Complaint**: 7-year-old male presenting with 24 hours of acute shortness of breath, expiratory wheezing, and dry cough following a viral upper respiratory infection.
-- **Pertinent Negatives**: Denies foreign body aspiration, stridor, or fever.
-
-### O — Objective
-- **Vital Signs**: ${vitalsStr}
-- **Physical Examination**: Moderate respiratory distress with mild intercostal retractions. Bilateral diffuse expiratory wheezes on auscultation. Air entry reduced at bases.
-
-### A — Assessment
-1. **Acute Asthma Exacerbation**: Moderate severity triggered by viral upper respiratory tract infection.
-2. **Differentials to Exclude**: Viral bronchiolitis, foreign body aspiration, pneumonia.
-
-#### Recommended ICD-10-CM Coding:
-- **J45.901** — *Unspecified asthma with (acute) exacerbation*
-- **J20.9** — *Acute bronchitis, unspecified*
-
-### P — Plan
-1. **Immediate Bronchodilator Therapy**: Inhaled Albuterol 2.5mg via nebulizer or 4-6 puffs via MDI with spacer every 20 minutes for 3 doses.
-2. **Systemic Corticosteroids**: Oral Prednisolone 1-2 mg/kg/day (max 60mg) for 3-5 days.
-3. **Monitoring & Precautions**: Continuous pulse oximetry targeting SpO2 > 94%. Reassess work of breathing and retractions post-nebulization.`;
-    }
-
-    // Generic dynamic clinical note for any other clinical scenario
-    return `### S — Subjective
-- **Clinical Encounter Summary**: ${input.slice(0, 300)}...
-- **Chief Complaint & Timeline**: Patient presents for clinical evaluation with active symptoms documented above.
-- **Review of Systems & History**: Pertinent clinical factors reviewed; vital signs and symptoms recorded during consultation.
-
-### O — Objective
-- **Vital Signs**: ${vitalsStr}
-- **Physical Examination**: Targeted examination performed corresponding to chief complaint. Findings as noted in clinical dictation.
-
-### A — Assessment
-1. **Primary Clinical Assessment**: Presentation consistent with clinical findings detailed in encounter documentation.
-2. **Differential Considerations**: Primary vs secondary etiologies considered; diagnostic rule-outs recommended.
-
-#### Recommended ICD-10-CM Coding:
-- **R69** — *Illness, unspecified* (Initial visit symptom code)
-- **Z00.00** — *Encounter for general adult medical examination without abnormal findings*
-
-### P — Plan
-1. **Diagnostic Evaluation**: Initial baseline laboratory screening and targeted imaging based on patient progression.
-2. **Therapeutic Protocol**: Conservative management with symptomatic pharmacotherapy as tolerated.
-3. **Precautions & Education**: Patient advised on warning signs and instructed to seek immediate emergency care if symptoms escalate.
-4. **Follow-Up**: Re-evaluation in clinic within 2-3 weeks.`;
-  };
-
   const executeMuseGeneration = async (forceSimulator = false) => {
     if (!transcript.trim()) {
       alert('Please enter or record a clinical transcript first.');
@@ -751,10 +673,10 @@ Model: Meta Muse Wonder 1.0 (Clinical Reasoning Engine)
     // If simulator or preview mode requested directly
     if (forceSimulator) {
       setTimeout(() => {
-        const note = generateClinicalNote(transcript, clinicalMode);
+        const note = generateDynamicClinicalNote(transcript, clinicalMode, customInstructions);
         setResult(note);
         setLoading(false);
-      }, 500);
+      }, 400);
       return;
     }
 
@@ -781,9 +703,9 @@ Model: Meta Muse Wonder 1.0 (Clinical Reasoning Engine)
 
       if (!response.ok) {
         // Meta API returned an error (e.g. 402 Billing Verification Required)
-        // Record error details for the info banner, but seamlessly generate the note using our Clinical Engine!
+        // Record error details for the info banner, but seamlessly generate the note using our Dynamic Clinical NLP Engine!
         setErrorDetails(data);
-        const fallbackNote = generateClinicalNote(transcript, clinicalMode);
+        const fallbackNote = generateDynamicClinicalNote(transcript, clinicalMode, customInstructions);
         setResult(fallbackNote);
         setLoading(false);
         return;
@@ -795,11 +717,13 @@ Model: Meta Muse Wonder 1.0 (Clinical Reasoning Engine)
       // Network failure or offline
       setErrorDetails({
         error: {
-          message: err.message || 'Network connection failed while reaching api.meta.ai. Running on Integrated Clinical Engine.',
+          message:
+            err.message ||
+            'Network connection failed while reaching api.meta.ai. Running on Dynamic Clinical NLP Engine.',
           code: 'network_fallback',
         },
       });
-      const fallbackNote = generateClinicalNote(transcript, clinicalMode);
+      const fallbackNote = generateDynamicClinicalNote(transcript, clinicalMode, customInstructions);
       setResult(fallbackNote);
     } finally {
       setLoading(false);
@@ -1029,10 +953,22 @@ Model: Meta Muse Wonder 1.0 (Clinical Reasoning Engine)
                 Clinical Transcript / Encounter Audio
               </label>
               <div className="flex items-center gap-2">
+                {isTranscribingAudio && (
+                  <span className="text-[11px] text-indigo-600 font-semibold flex items-center gap-1 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Transcribing with ElevenLabs Scribe v2 Medical...
+                  </span>
+                )}
                 <label className="cursor-pointer text-xs font-medium text-slate-600 hover:text-indigo-600 flex items-center gap-1 px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 transition">
                   <Upload className="w-3.5 h-3.5" />
-                  Upload Audio
-                  <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" />
+                  Upload Audio (ElevenLabs STT)
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    onChange={handleFileUpload}
+                    className="hidden"
+                    disabled={isTranscribingAudio}
+                  />
                 </label>
               </div>
             </div>
@@ -1059,16 +995,23 @@ Model: Meta Muse Wonder 1.0 (Clinical Reasoning Engine)
                 ) : (
                   <button
                     onClick={handleStartRecording}
-                    className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold flex items-center gap-1.5 shadow-sm transition"
+                    disabled={isTranscribingAudio}
+                    className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold flex items-center gap-1.5 shadow-sm transition disabled:opacity-50"
                   >
-                    <Mic className="w-3.5 h-3.5" />
-                    Record Doctor Dictation
+                    <Mic className="w-3.5 h-3.5 text-rose-400" />
+                    Record Doctor Dictation (Live Voice)
                   </button>
                 )}
                 {isRecording && (
-                  <span className="text-xs text-rose-600 font-medium flex items-center gap-1">
+                  <span className="text-xs text-rose-600 font-medium flex items-center gap-1.5">
                     <span className="w-2 h-2 rounded-full bg-rose-600 animate-ping" />
-                    Listening to microphone...
+                    {liveSpeechStatus || 'Listening to microphone (speak now)...'}
+                  </span>
+                )}
+                {isTranscribingAudio && !isRecording && (
+                  <span className="text-xs text-indigo-600 font-medium flex items-center gap-1.5">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Transcribing audio with ElevenLabs Scribe v2 Medical...
                   </span>
                 )}
               </div>
